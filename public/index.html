@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Mockbook</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@600;700&display=swap" rel="stylesheet">
+<style>
+:root{color-scheme:dark;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html{scroll-behavior:smooth}
+body{font-family:Barlow,system-ui,-apple-system,"Segoe UI",sans-serif;background:#0f172a}
+.num{font-family:"Barlow Condensed","Arial Narrow",system-ui,sans-serif;font-variant-numeric:tabular-nums}
+.odd{transition:background .15s,transform .1s}.odd:active{transform:scale(.96)}
+.odd.on{background:#059669;color:#fff;border-color:#34d399}
+@keyframes tin{from{transform:translateX(24px);opacity:0}to{transform:none;opacity:1}}
+.toast{animation:tin .25s ease-out}
+@media (prefers-reduced-motion:reduce){.toast{animation:none}html{scroll-behavior:auto}}
+button:focus-visible,input:focus-visible{outline:2px solid #34d399;outline-offset:2px}
+</style>
+</head>
+<body class="bg-slate-900 text-slate-200 min-h-screen">
+<div id="toasts" class="fixed right-3 top-3 z-50 flex flex-col gap-2 w-72 max-w-[calc(100%-1.5rem)]"></div>
+<div id="modal"></div>
+<div id="app" class="max-w-7xl mx-auto px-3 sm:px-5 py-4"></div>
+<a href="#slip" class="lg:hidden fixed bottom-4 right-4 z-40 bg-emerald-600 text-white rounded-full px-4 py-3 shadow-lg font-semibold">Bet slip <span id="fab" class="num bg-slate-900/40 rounded-full px-2 ml-1">0</span></a>
+
+<script>
+const $=s=>document.querySelector(s);
+const money=n=>(n<0?"-":"")+"$"+Math.abs(n).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const dec=a=>a>0?1+a/100:1+100/-a;
+const SP={nba:["🏀","NBA"],nfl:["🏈","NFL"],cbb:["🎓","CBB"],cfb:["🏟️","CFB"],soccer:["⚽","Soccer"]};
+const LV=200,DAILY_MS=90000,KEY="mockbook-v2",POLL_MS=30000,VOID_MS=4*864e5;
+const PERSIST=["name","xp","bank","bets","ledger","ach","streak","best","claims","maxSlip","dailyAt","fmt","nid"];
+let S,G=[],R={},feed={state:"connecting",at:0,msg:""};
+const card="bg-slate-800/70 border border-slate-700 rounded-xl";
+const fo=a=>a==null?"–":S.fmt==="dec"?dec(a).toFixed(2):(a>0?"+":"")+a;
+const typing=()=>{const a=document.activeElement;return a&&(a.id==="stake"||a.id==="depamt")};
+
+/* ---------- state ---------- */
+function fresh(){
+ S={name:"Player One",xp:0,bank:1000,bets:[],ledger:[],ach:{},streak:0,best:0,claims:0,maxSlip:0,dailyAt:0,fmt:"am",nid:0,
+    filter:"all",tab:"bets",modal:false,dep:500,slip:{sel:[],mode:"single",stake:50}};
+ log("Starting bankroll",1000);
+}
+function load(){try{const o=JSON.parse(localStorage.getItem(KEY)||"null");if(o)PERSIST.forEach(k=>{if(o[k]!==undefined)S[k]=o[k]})}catch(e){}}
+function save(){try{const o={};PERSIST.forEach(k=>o[k]=S[k]);localStorage.setItem(KEY,JSON.stringify(o))}catch(e){}}
+function log(label,amt){S.ledger.unshift({t:Date.now(),label,amt,bal:S.bank})}
+const lvl=()=>1+Math.floor(S.xp/LV);
+function toast(msg,type="ok"){
+ const el=document.createElement("div");
+ el.className="toast rounded-lg border px-3 py-2 text-sm shadow-xl "+({ok:"bg-emerald-950 border-emerald-600 text-emerald-100",bad:"bg-rose-950 border-rose-700 text-rose-100",ach:"bg-amber-950 border-amber-500 text-amber-100"}[type]);
+ el.innerHTML=msg;$("#toasts").appendChild(el);setTimeout(()=>el.remove(),4200);
+}
+function gainXp(n){const b=lvl();S.xp+=n;if(lvl()>b)toast("⬆️ Level up! You’re now level "+lvl()+".","ach")}
+const started=ko=>Date.now()>=ko;
+const done=id=>R[id]&&R[id].completed;
+
+/* ---------- slip ---------- */
+function calc(){
+ const {sel,mode,stake}=S.slip,n=sel.length,st=Math.max(0,+stake||0);
+ if(mode==="parlay"&&n>1){const d=sel.reduce((p,s)=>p*dec(s.odds),1),boost=.05*(n-1);return{parlay:true,n,total:st,odds:d,boost,payout:st*(1+(d-1)*(1+boost))}}
+ return{parlay:false,n,total:st*n,payout:sel.reduce((p,s)=>p+st*dec(s.odds),0)};
+}
+function legOf(f,m,side){
+ const o=f[m],team=side==="home"?f.home:f.away;let line=0,desc;
+ if(m==="ml")desc=side==="draw"?"Draw":team+" ML";
+ else if(m==="sp"){line=side==="home"?o.line:-o.line;desc=team+" "+(line>0?"+":"")+line}
+ else{line=o.line;desc=(side==="over"?"Over ":"Under ")+line}
+ return{eid:f.id,sport:f.sport,lg:f.lg,ko:f.ko,m,side,line,odds:o[side],desc,match:f.away+" at "+f.home};
+}
+function toggleOdd(id,m,side){
+ const f=G.find(x=>x.id===id);if(!f||!f[m])return;
+ if(started(f.ko))return toast("Betting is closed: that game has started.","bad");
+ const sel=S.slip.sel,i=sel.findIndex(s=>s.eid===id);
+ const same=i>-1&&sel[i].m===m&&sel[i].side===side;
+ if(i>-1)sel.splice(i,1);
+ if(!same)sel.push(legOf(f,m,side));
+ if(sel.length<2)S.slip.mode="single";
+ render();
+}
+function place(){
+ const c=calc(),st=+S.slip.stake;
+ if(!S.slip.sel.length)return toast("Add a selection to your slip first.","bad");
+ if(!(st>=1))return toast("Enter a stake of at least $1.","bad");
+ if(c.total>S.bank)return toast("Not enough bankroll. This slip costs "+money(c.total)+".","bad");
+ if(S.slip.sel.some(s=>started(s.ko)))return toast("A game on your slip has already started. Remove it to continue.","bad");
+ const mk=(legs,stake,payout,type)=>({id:++S.nid,type,legs,stake,payout,status:"pending",net:0,t:Date.now()});
+ if(c.parlay)S.bets.unshift(mk(S.slip.sel.map(s=>({...s})),st,c.payout,"Parlay"));
+ else S.slip.sel.forEach(s=>S.bets.unshift(mk([{...s}],st,st*dec(s.odds),"Single")));
+ S.bank-=c.total;S.maxSlip=Math.max(S.maxSlip,c.total);
+ log((c.parlay?c.n+"-leg parlay":c.n+" single"+(c.n>1?"s":""))+" placed",-c.total);
+ gainXp(5);
+ toast("✅ Bet placed: "+money(c.total)+" risked to win "+money(c.payout-c.total)+". Your balance updates when the real final score is in.");
+ S.slip.sel=[];S.slip.mode="single";
+ checkAch();render();poll();
+}
+
+/* ---------- settlement (real final scores only) ---------- */
+function grade(l,r){ // true = win, false = loss, null = push
+ if(l.m==="tot"){const t=r.h+r.a;return t===l.line?null:l.side==="over"?t>l.line:t<l.line}
+ const mine=l.side==="home"?r.h:r.a,other=l.side==="home"?r.a:r.h;
+ if(l.m==="ml")return l.side==="draw"?r.h===r.a:mine>other;
+ const x=mine+l.line;return x===other?null:x>other;
+}
+function settleBets(){
+ let w=0,l=0,v=0,p=0,net=0;
+ S.bets.slice().reverse().filter(b=>b.status==="pending").forEach(b=>{
+  if(!b.legs.every(x=>done(x.eid))){
+   if(Date.now()-b.t>VOID_MS){b.status="void";b.net=0;S.bank+=b.stake;log("Bet voided, no result found",b.stake);v++}
+   return;
+  }
+  const gs=b.legs.map(x=>grade(x,R[x.eid])),live=b.legs.filter((x,i)=>gs[i]!==null);
+  if(!gs.includes(false)&&live.length<b.legs.length){
+   if(!live.length){b.status="push";b.net=0;S.bank+=b.stake;log("Push, stake refunded",b.stake);p++;return}
+   const d=live.reduce((q,x)=>q*dec(x.odds),1);
+   b.payout=live.length>1?b.stake*(1+(d-1)*(1+.05*(live.length-1))):b.stake*d;
+  }
+  const won=!gs.includes(false);
+  b.status=won?"won":"lost";b.net=won?b.payout-b.stake:-b.stake;net+=b.net;
+  b.finals=b.legs.map(x=>({eid:x.eid,h:R[x.eid].h,a:R[x.eid].a,home:R[x.eid].home,away:R[x.eid].away}));
+  if(won){w++;S.bank+=b.payout;log(b.type+" won: "+b.legs[0].desc+(b.legs.length>1?" +"+(b.legs.length-1):""),b.payout);gainXp(25+Math.min(100,Math.round(b.net/10)));S.streak=S.streak>0?S.streak+1:1}
+  else{l++;gainXp(5);S.streak=S.streak<0?S.streak-1:-1}
+  S.best=Math.max(S.best,S.streak);
+ });
+ if(w+l)toast("📊 Settled "+(w+l)+" bet"+(w+l>1?"s":"")+": "+w+" won, "+l+" lost ("+money(net)+")."+(w?" Payouts added to your bankroll.":""),net>=0?"ok":"bad");
+ if(v)toast("↩️ "+v+" bet"+(v>1?"s":"")+" voided and refunded: no result was found.");
+ if(p)toast("🤝 "+p+" bet"+(p>1?"s":"")+" pushed and refunded.");
+ if(w+l+v+p){checkAch();return true}
+ return false;
+}
+
+/* ---------- achievements, daily, deposits ---------- */
+const ACH=[
+ {id:"first",n:"First Blood",d:"Win your first bet",i:"🎯",ok:()=>S.bets.some(b=>b.status==="won")},
+ {id:"sharp",n:"Sharp Bettor",d:"Hit a parlay with 3+ legs",i:"🧠",ok:()=>S.bets.some(b=>b.status==="won"&&b.legs.length>=3)},
+ {id:"roller",n:"High Roller",d:"Risk $500 or more on one slip",i:"💎",ok:()=>S.maxSlip>=500},
+ {id:"fire",n:"On Fire",d:"Win 5 bets in a row",i:"🔥",ok:()=>S.best>=5},
+ {id:"dog",n:"Dog Whisperer",d:"Win a +200 or longer single",i:"🐶",ok:()=>S.bets.some(b=>b.status==="won"&&b.legs.length===1&&b.legs[0].odds>=200)},
+ {id:"double",n:"Doubled Up",d:"Reach a $2,000 bankroll",i:"💰",ok:()=>S.bank>=2000},
+ {id:"daily",n:"Regular",d:"Claim a daily allowance",i:"📅",ok:()=>S.claims>0}
+];
+function checkAch(){ACH.forEach(a=>{if(!S.ach[a.id]&&a.ok()){S.ach[a.id]=1;gainXp(50);toast(a.i+" Achievement unlocked: <b>"+a.n+"</b> (+50 XP)","ach")}})}
+function claim(){
+ if(S.dailyAt+DAILY_MS-Date.now()>0)return;
+ S.dailyAt=Date.now();S.bank+=250;S.claims++;log("Daily allowance",250);gainXp(10);
+ toast("🎁 Claimed your $250 daily allowance.");checkAch();render();
+}
+function stats(){
+ const d=S.bets.filter(b=>b.status==="won"||b.status==="lost"),won=d.filter(b=>b.status==="won");
+ const staked=d.reduce((p,b)=>p+b.stake,0),net=d.reduce((p,b)=>p+b.net,0),pend=S.bets.filter(b=>b.status==="pending");
+ return{net,roi:staked?net/staked*100:0,wr:d.length?won.length/d.length*100:0,n:d.length,w:won.length,pend:pend.length,risk:pend.reduce((p,b)=>p+b.stake,0)};
+}
+
+/* ---------- live data ---------- */
+async function poll(){
+ const watch=[...new Set(S.bets.filter(b=>b.status==="pending").flatMap(b=>b.legs.map(l=>l.lg||l.sport)))];
+ let changed=false;
+ try{
+  const r=await fetch("/api/data?watch="+watch.join(","),{cache:"no-store"});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(d.error||"HTTP "+r.status);
+  G=d.games||[];R={...R,...d.scores};
+  S.slip.sel=S.slip.sel.filter(s=>G.some(g=>g.id===s.eid)&&!started(s.ko));
+  feed={state:"live",at:d.updatedAt||Date.now(),msg:(d.errors||[]).join("; ")};
+  changed=settleBets();
+ }catch(e){feed={state:"error",at:feed.at,msg:e.message}}
+ if(changed||!typing())render();
+}
+function feedLabel(){
+ if(feed.state==="live"){const s=Math.max(0,Math.round((Date.now()-feed.at)/1000));return `<span class="text-emerald-400">● Live feed</span> · data ${s<90?s+"s":Math.round(s/60)+" min"} old${feed.msg?` · <span class="text-amber-300">partial: ${esc(feed.msg)}</span>`:""}`}
+ if(feed.state==="error")return `<span class="text-rose-400">● Feed error</span>: ${esc(feed.msg)}. Retrying every 30 seconds.`;
+ return "Connecting to live feed…";
+}
+
+/* ---------- rendering ---------- */
+function ob(f,m,side,label,odds){
+ if(odds==null)return `<div class="rounded-md border border-slate-800 py-1.5 text-center text-slate-600 num text-lg">–</div>`;
+ const on=S.slip.sel.some(s=>s.eid===f.id&&s.m===m&&s.side===side),lock=started(f.ko);
+ return `<button data-a="odd" data-f="${f.id}" data-m="${m}" data-s="${side}" class="odd ${lock?"opacity-40 cursor-not-allowed ":""}${on?"on":"bg-slate-900 border-slate-700 hover:bg-slate-700"} border rounded-md px-2 py-1.5 w-full text-center leading-tight" aria-pressed="${on}"><span class="block text-[11px] ${on?"text-emerald-100":"text-slate-400"}">${label}</span><span class="num text-lg ${on?"":"text-emerald-400"}">${fo(odds)}</span></button>`;
+}
+function fixtureCard(f){
+ const sp=n=>(n>0?"+":"")+n,L=R[f.id],lock=started(f.ko);
+ const row=(side,team)=>{
+  const dir=side==="home"?"over":"under";
+  return `<div class="grid grid-cols-[1fr_4.5rem_4.5rem_4.5rem] sm:grid-cols-[1fr_5.5rem_5.5rem_5.5rem] gap-1.5 items-center">
+  <div class="font-semibold truncate">${esc(team)}${L?` <span class="num text-lg text-white">${side==="home"?L.h:L.a}</span>`:""}</div>
+  ${ob(f,"ml",side,"ML",f.ml&&f.ml[side])}
+  ${ob(f,"sp",side,f.sp?sp(side==="home"?f.sp.line:-f.sp.line):"Spread",f.sp&&f.sp[side])}
+  ${ob(f,"tot",dir,f.tot?(side==="home"?"O ":"U ")+f.tot.line:"Total",f.tot&&f.tot[dir])}</div>`;
+ };
+ const when=new Date(f.ko).toLocaleString([],{weekday:"short",hour:"numeric",minute:"2-digit"});
+ return `<article class="${card} p-3 space-y-2">
+  <div class="flex justify-between text-xs text-slate-400"><span>${SP[f.sport][0]} ${f.label||SP[f.sport][1]}</span>${lock?`<span class="text-rose-400">● In progress${L?" · live score":" · awaiting score"}</span>`:`<span class="text-sky-300">Upcoming · ${when}</span>`}</div>
+  <div class="grid grid-cols-[1fr_4.5rem_4.5rem_4.5rem] sm:grid-cols-[1fr_5.5rem_5.5rem_5.5rem] gap-1.5 text-[11px] text-slate-500 text-center"><span></span><span>Moneyline</span><span>Spread</span><span>Total</span></div>
+  ${f.sport==="soccer"?row("home",f.home)+row("away",f.away):row("away",f.away)+row("home",f.home)}${f.ml&&f.ml.draw!=null?`<div class="grid grid-cols-[1fr_4.5rem_4.5rem_4.5rem] sm:grid-cols-[1fr_5.5rem_5.5rem_5.5rem] gap-1.5 items-center"><div class="text-slate-400">Draw</div>${ob(f,"ml","draw","Draw",f.ml.draw)}<span></span><span></span></div>`:""}</article>`;
+}
+function totalsHtml(c){
+ return `${c.parlay?`<div class="flex justify-between"><span class="text-slate-400">Combined odds</span><span class="num text-emerald-400">${c.odds.toFixed(2)}x</span></div>
+  <div class="flex justify-between"><span class="text-slate-400">Boost bonus</span><span class="num text-amber-300">+${(c.boost*100).toFixed(0)}% profit</span></div>`:""}
+  <div class="flex justify-between"><span class="text-slate-400">Total risk</span><span class="num text-lg">${money(c.total)}</span></div>
+  <div class="flex justify-between"><span class="text-slate-400">Potential payout</span><span class="num text-xl text-emerald-400">${money(c.payout)}</span></div>`;
+}
+function slipHtml(){
+ const {sel,mode,stake}=S.slip,c=calc();
+ return `<div class="${card} p-4 space-y-3">
+  <div class="flex items-center justify-between"><h2 class="num text-2xl font-bold">Bet slip <span class="text-emerald-400">${sel.length}</span></h2>${sel.length?`<button data-a="clear" class="text-xs text-slate-400 hover:text-white underline">Clear all</button>`:""}</div>
+  ${sel.length?`<ul class="space-y-2">${sel.map((s,i)=>`<li class="bg-slate-900 border border-slate-700 rounded-lg p-2 flex justify-between gap-2"><div class="min-w-0"><div class="font-semibold truncate">${esc(s.desc)}</div><div class="text-xs text-slate-400 truncate">${esc(s.match)}</div></div><div class="flex items-start gap-2"><span class="num text-lg text-emerald-400">${fo(s.odds)}</span><button data-a="rm" data-i="${i}" aria-label="Remove selection" class="text-slate-500 hover:text-rose-400 text-lg leading-none">×</button></div></li>`).join("")}</ul>
+  <div class="grid grid-cols-2 gap-1 bg-slate-900 p-1 rounded-lg text-sm"><button data-a="mode" data-v="single" class="rounded-md py-1.5 ${mode==="single"?"bg-emerald-600 text-white":"text-slate-400"}">Singles</button><button data-a="mode" data-v="parlay" ${sel.length<2?"disabled":""} class="rounded-md py-1.5 ${mode==="parlay"?"bg-emerald-600 text-white":"text-slate-400"} disabled:opacity-40">Parlay boost</button></div>
+  <label class="block text-sm text-slate-400">${mode==="parlay"?"Stake":"Stake per selection"}<div class="mt-1 flex items-center bg-slate-900 border border-slate-700 rounded-lg px-3"><span class="text-slate-500">$</span><input id="stake" type="number" min="1" step="1" inputmode="decimal" value="${stake}" class="num text-xl bg-transparent w-full py-2 px-2 outline-none text-white"></div></label>
+  <div class="flex gap-1.5">${[10,50,100,250].map(v=>`<button data-a="chip" data-v="${v}" class="flex-1 bg-slate-900 border border-slate-700 hover:border-emerald-500 rounded-md py-1 text-sm">$${v}</button>`).join("")}<button data-a="chip" data-v="max" class="flex-1 bg-slate-900 border border-slate-700 hover:border-emerald-500 rounded-md py-1 text-sm">Max</button></div>
+  <div id="totals" class="border-t border-slate-700 pt-3 text-sm space-y-1">${totalsHtml(c)}</div>
+  <button data-a="place" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg py-3">Place bet</button>`
+  :`<p class="text-slate-400 text-sm py-6 text-center">Your slip is empty. Select any odds on the board to add a pick.</p>`}</div>`;
+}
+const box=(l,v,c="")=>`<div class="${card} p-3"><div class="text-xs text-slate-400">${l}</div><div class="num text-3xl ${c}">${v}</div></div>`;
+function legLine(l){
+ const r=R[l.eid],fin=done(l.eid),ok=fin?grade(l,r):undefined;
+ const right=fin?`${ok===null?"Push · ":""}Final ${esc(r.away)} ${r.a}–${r.h} ${esc(r.home)}`:started(l.ko)?(r?`Live ${r.a}–${r.h}`:"In progress"):"Pending";
+ return `<div class="text-xs flex justify-between gap-2"><span class="truncate">${esc(l.desc)} <span class="text-slate-500">(${fo(l.odds)})</span></span><span class="shrink-0 ${ok===undefined?"text-slate-500":ok===null?"text-amber-300":ok?"text-emerald-400":"text-rose-400"}">${right}</span></div>`;
+}
+function betRow(b){
+ const col=b.status==="won"?"text-emerald-400":b.status==="lost"?"text-rose-400":"text-sky-300";
+ const label=b.status==="pending"?"Pending":b.status==="won"?"Won +"+money(b.net):b.status==="lost"?"Lost "+money(b.net):b.status==="push"?"Push, refunded":"Voided";
+ return `<li class="bg-slate-900 border border-slate-700 rounded-lg p-2.5 space-y-1"><div class="flex justify-between"><span class="font-semibold">${b.type}${b.legs.length>1?" · "+b.legs.length+" legs":""}</span><span class="num text-lg ${col}">${label}</span></div>${b.legs.map(legLine).join("")}<div class="text-xs text-slate-500">Stake ${money(b.stake)} · To return ${money(b.payout)}</div></li>`;
+}
+function render(){
+ const st=stats(),left=Math.max(0,S.dailyAt+DAILY_MS-Date.now());
+ S.slip.sel=S.slip.sel.filter(s=>!started(s.ko));
+ const fx=G.filter(f=>!done(f.id)&&(S.filter==="all"||f.sport===S.filter)).sort((a,b)=>a.ko-b.ko).slice(0,120);
+ const pend=S.bets.filter(b=>b.status==="pending"),fin=S.bets.filter(b=>b.status!=="pending");
+ $("#app").innerHTML=`
+ <header class="${card} p-4 flex flex-wrap items-center gap-4 justify-between">
+  <div class="min-w-0"><h1 class="num text-3xl font-bold leading-none">Mock<span class="text-emerald-400">book</span></h1><p class="text-xs text-slate-400 mt-1">Virtual money only. Real games, real odds, real final scores.</p></div>
+  <div class="flex items-center gap-3"><div class="w-40"><div class="flex justify-between text-xs"><span>${esc(S.name)}</span><span class="text-emerald-400">Level ${lvl()}</span></div><div class="h-2 bg-slate-900 rounded-full mt-1 overflow-hidden"><div class="h-full bg-emerald-500" style="width:${(S.xp%LV)/LV*100}%"></div></div><div class="text-[11px] text-slate-500 mt-0.5">${S.xp%LV} / ${LV} XP</div></div>
+  <div class="text-right"><div class="text-xs text-slate-400">Bankroll</div><div class="num text-3xl text-emerald-400 leading-none">${money(S.bank)}</div></div></div>
+  <div class="flex gap-2 w-full sm:w-auto"><button data-a="dep" class="bg-slate-900 border border-emerald-600 text-emerald-300 hover:bg-emerald-600 hover:text-white rounded-lg px-3 py-2 text-sm font-semibold">+ Deposit</button>
+   <button id="daily" data-a="daily" class="flex-1 sm:flex-none bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 disabled:text-slate-400 text-white rounded-lg px-3 py-2 text-sm font-semibold" ${left?"disabled":""}>${left?dailyLabel(left):"Claim daily $250 allowance"}</button>
+   <button data-a="fmt" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm">${S.fmt==="am"?"American":"Decimal"} odds</button></div>
+ </header>
+ <section class="grid grid-cols-2 md:grid-cols-4 gap-3 my-4">
+  ${box("Net profit / loss",money(st.net),st.net>=0?"text-emerald-400":"text-rose-400")}${box("Win rate",st.wr.toFixed(1)+"%","text-white")}${box("ROI",st.roi.toFixed(1)+"%",st.roi>=0?"text-emerald-400":"text-rose-400")}${box("Streak",S.streak===0?"–":(S.streak>0?"W":"L")+Math.abs(S.streak),S.streak>0?"text-emerald-400":S.streak<0?"text-rose-400":"")}
+ </section>
+ <p class="text-xs text-slate-500 -mt-2 mb-4">${st.w} won of ${st.n} settled · best streak W${S.best} · ${st.pend} pending (${money(st.risk)} at risk)</p>
+ <div class="grid lg:grid-cols-[1fr_380px] gap-4 items-start">
+  <main class="space-y-3 min-w-0">
+   <div class="flex flex-wrap gap-2 items-center justify-between">
+    <div class="flex gap-1.5 overflow-x-auto">${[["all","All"],...Object.entries(SP).map(([k,v])=>[k,v[0]+" "+v[1]])].map(([k,l])=>`<button data-a="filter" data-v="${k}" class="whitespace-nowrap rounded-full px-3 py-1.5 text-sm border ${S.filter===k?"bg-emerald-600 border-emerald-500 text-white":"bg-slate-800 border-slate-700 text-slate-300"}">${l}</button>`).join("")}</div>
+    <div class="text-xs text-slate-400">${feedLabel()}</div></div>
+   ${fx.map(fixtureCard).join("")||`<p class="text-slate-400">${feed.state==="live"?"No games listed for this category right now.":"Waiting for the live feed…"}</p>`}
+  </main>
+  <aside id="slip" class="lg:sticky lg:top-4">${slipHtml()}</aside>
+ </div>
+ <section class="${card} p-4 mt-4"><h2 class="num text-2xl font-bold mb-3">Achievements <span class="text-sm font-sans font-normal text-slate-400">${Object.keys(S.ach).length} of ${ACH.length} unlocked</span></h2>
+  <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">${ACH.map(a=>{const u=S.ach[a.id];return `<div class="rounded-lg border p-2.5 text-center ${u?"bg-emerald-950 border-emerald-600":"bg-slate-900 border-slate-700 opacity-50"}"><div class="text-2xl ${u?"":"grayscale"}">${a.i}</div><div class="font-semibold text-sm">${a.n}</div><div class="text-[11px] text-slate-400">${a.d}</div></div>`}).join("")}</div></section>
+ <section class="${card} p-4 mt-4"><div class="flex items-center justify-between mb-3"><div class="flex gap-1.5">${[["bets","Bet history"],["ledger","Transactions"]].map(([k,l])=>`<button data-a="tab" data-v="${k}" class="rounded-full px-3 py-1.5 text-sm border ${S.tab===k?"bg-emerald-600 border-emerald-500 text-white":"bg-slate-900 border-slate-700 text-slate-300"}">${l}</button>`).join("")}</div><button data-a="reset" class="text-xs text-slate-400 hover:text-rose-400 underline">Reset Mockbook</button></div>
+  ${S.tab==="bets"?(S.bets.length?`<ul class="grid md:grid-cols-2 gap-2 max-h-[32rem] overflow-y-auto">${[...pend,...fin].slice(0,40).map(betRow).join("")}</ul>`:`<p class="text-slate-400 text-sm">No bets yet. Place your first bet from the board.</p>`)
+  :`<div class="overflow-x-auto max-h-[28rem] overflow-y-auto"><table class="w-full text-sm"><thead class="text-slate-400 text-left"><tr><th class="py-1">Time</th><th>Description</th><th class="text-right">Amount</th><th class="text-right">Balance</th></tr></thead><tbody>${S.ledger.slice(0,60).map(t=>`<tr class="border-t border-slate-700"><td class="py-1.5 text-slate-500">${new Date(t.t).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}</td><td>${esc(t.label)}</td><td class="num text-right text-base ${t.amt>=0?"text-emerald-400":"text-rose-400"}">${t.amt>=0?"+":""}${money(t.amt)}</td><td class="num text-right text-base">${money(t.bal)}</td></tr>`).join("")}</tbody></table></div>`}</section>`;
+ $("#fab").textContent=S.slip.sel.length;renderModal();save();
+}
+const dailyLabel=ms=>{const s=Math.ceil(ms/1000);return "Next allowance in "+Math.floor(s/60)+":"+String(s%60).padStart(2,"0")};
+function renderModal(){
+ $("#modal").innerHTML=!S.modal?"":`<div data-a="closedep" class="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4"><div role="dialog" aria-label="Deposit funds" class="${card} !bg-slate-800 w-full max-w-sm p-5 space-y-3">
+ <div class="flex justify-between items-center"><h2 class="num text-2xl font-bold">Deposit funds</h2><button data-a="closedep" aria-label="Close" class="text-slate-400 hover:text-white text-2xl leading-none">×</button></div>
+ <p class="text-sm text-slate-400">This is a mock deposit. No real money moves and nothing is charged.</p>
+ <div class="grid grid-cols-4 gap-1.5">${[100,500,1000,5000].map(v=>`<button data-a="depamt" data-v="${v}" class="rounded-md border py-1.5 num text-lg ${+S.dep===v?"bg-emerald-600 border-emerald-500 text-white":"bg-slate-900 border-slate-700"}">$${v.toLocaleString()}</button>`).join("")}</div>
+ <label class="block text-sm text-slate-400">Custom amount (up to $10,000)<div class="mt-1 flex items-center bg-slate-900 border border-slate-700 rounded-lg px-3"><span class="text-slate-500">$</span><input id="depamt" type="number" min="1" max="10000" step="1" value="${S.dep}" class="num text-xl bg-transparent w-full py-2 px-2 outline-none text-white"></div></label>
+ <button id="depgo" data-a="depgo" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg py-3">Add ${money(+S.dep||0)} to bankroll</button></div></div>`;
+}
+function updateTotals(){const t=$("#totals");if(t)t.innerHTML=totalsHtml(calc())}
+
+document.addEventListener("click",e=>{
+ const b=e.target.closest("[data-a]");if(!b||b.disabled)return;
+ const a=b.dataset.a,v=b.dataset.v;
+ if(a==="odd")toggleOdd(b.dataset.f,b.dataset.m,b.dataset.s);
+ else if(a==="rm"){S.slip.sel.splice(+b.dataset.i,1);if(S.slip.sel.length<2)S.slip.mode="single";render()}
+ else if(a==="clear"){S.slip.sel=[];S.slip.mode="single";render()}
+ else if(a==="mode"){S.slip.mode=v;render()}
+ else if(a==="chip"){S.slip.stake=v==="max"?Math.max(1,Math.floor(S.bank/Math.max(1,S.slip.mode==="single"?S.slip.sel.length:1))):+v;render()}
+ else if(a==="place")place();
+ else if(a==="daily")claim();
+ else if(a==="filter"){S.filter=v;render()}
+ else if(a==="fmt"){S.fmt=S.fmt==="am"?"dec":"am";render()}
+ else if(a==="tab"){S.tab=v;render()}
+ else if(a==="reset"){if(confirm("Reset your bankroll, bets and history?")){fresh();render();toast("Mockbook reset to a $1,000 bankroll.")}}
+ else if(a==="dep"){S.modal=true;renderModal()}
+ else if(a==="closedep"){if(b===e.target||b.tagName==="BUTTON"){S.modal=false;renderModal()}}
+ else if(a==="depamt"){S.dep=+v;renderModal()}
+ else if(a==="depgo"){const x=Math.floor(+S.dep);if(!(x>=1&&x<=10000))return toast("Enter a deposit between $1 and $10,000.","bad");S.bank+=x;log("Deposit (mock)",x);S.modal=false;toast("💵 Deposited "+money(x)+" in mock funds.");checkAch();render()}
+});
+document.addEventListener("input",e=>{
+ if(e.target.id==="stake"){S.slip.stake=e.target.value;updateTotals()}
+ if(e.target.id==="depamt"){S.dep=e.target.value;const g=$("#depgo");if(g)g.textContent="Add "+money(+S.dep||0)+" to bankroll"}
+});
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&S.modal){S.modal=false;renderModal()}});
+setInterval(()=>{const b=$("#daily");if(!b)return;const l=S.dailyAt+DAILY_MS-Date.now();
+ if(l>0)b.textContent=dailyLabel(l);else if(b.disabled){b.disabled=false;b.textContent="Claim daily $250 allowance"}},1000);
+setInterval(poll,POLL_MS);
+document.addEventListener("visibilitychange",()=>{if(!document.hidden)poll()});
+
+fresh();load();render();poll();
+</script>
+</body>
+</html>
